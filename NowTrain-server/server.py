@@ -74,6 +74,8 @@ class Vehicle(BaseModel):
     to_stop_id: Optional[str] = None
     timestamp: Optional[int] = None
     progress: Optional[float] = None
+    source: Optional[str] = None  # "schedule" | "realtime" | "interpolated"
+    delay: Optional[int] = None  # 遅延（秒）
 
 class Snapshot(BaseModel):
     ts: int
@@ -158,18 +160,25 @@ def interpolate_position(
     delay_sec: int
 ) -> Optional[Dict[str, float]]:
     """駅間の位置を時刻表ベースで補間"""
-    
-    # from/to の駅IDを探す
+
+    # from/to の駅IDを探す（ODPT形式のIDで照合）
     from_idx = None
     to_idx = None
-    
+
+    from_station_id = from_station.get("id")
+    to_station_id = to_station.get("id")
+
     for i, stop in enumerate(timetable_stops):
-        if stop["stop_id"] == from_station.get("id"):
+        # stop["stop_id"] はODPT形式: "odpt.Station:..."
+        # from_station["id"] もODPT形式なので直接比較
+        if stop["stop_id"] == from_station_id:
             from_idx = i
-        if stop["stop_id"] == to_station.get("id"):
+        if stop["stop_id"] == to_station_id:
             to_idx = i
-    
+
     if from_idx is None or to_idx is None or from_idx >= to_idx:
+        # デバッグログ
+        print(f"[interpolate_position] Station not found in timetable: from={from_station_id}, to={to_station_id}")
         return None
     
     from_stop = timetable_stops[from_idx]
@@ -245,6 +254,8 @@ def map_odpt_trains_to_vehicles(items: List[Dict[str, Any]]) -> List[Vehicle]:
                 pass
         
         # 状態判定
+        source = "realtime"  # デフォルトはリアルタイム
+
         if to_station_id is None:
             # 駅に停車中
             status = "STOPPED_AT"
@@ -253,6 +264,7 @@ def map_odpt_trains_to_vehicles(items: List[Dict[str, Any]]) -> List[Vehicle]:
                 lat = station["lat"]
                 lng = station["lng"]
                 progress = 0.0
+                source = "schedule"  # 駅位置は時刻表由来
             else:
                 lat = None
                 lng = None
@@ -260,12 +272,12 @@ def map_odpt_trains_to_vehicles(items: List[Dict[str, Any]]) -> List[Vehicle]:
         else:
             # 駅間移動中
             status = "IN_TRANSIT_TO"
-            
+
             # 時刻表から位置を補間
             timetable = cache.timetables.get(trip_id_raw) or cache.timetables.get(trip_id)
             from_station = cache.stations.get(from_station_id)
             to_station = cache.stations.get(to_station_id)
-            
+
             if timetable and from_station and to_station:
                 pos = interpolate_position(
                     from_station,
@@ -278,22 +290,30 @@ def map_odpt_trains_to_vehicles(items: List[Dict[str, Any]]) -> List[Vehicle]:
                     lat = pos["lat"]
                     lng = pos["lng"]
                     progress = pos["progress"]
+                    source = "interpolated"  # 時刻表ベースの補間
+                    if idx < 3:  # 最初の3件だけログ出力
+                        print(f"[map_odpt] {trip_id}: Interpolated position: {lat:.5f}, {lng:.5f}, progress={progress:.2f}")
                 else:
                     # フォールバック: 中間地点
                     lat = (from_station["lat"] + to_station["lat"]) / 2
                     lng = (from_station["lng"] + to_station["lng"]) / 2
                     progress = 0.5
+                    source = "fallback"
+                    if idx < 3:
+                        print(f"[map_odpt] {trip_id}: Fallback to midpoint (timetable not found)")
             else:
                 # 駅座標だけある場合は中間地点
                 if from_station and to_station:
                     lat = (from_station["lat"] + to_station["lat"]) / 2
                     lng = (from_station["lng"] + to_station["lng"]) / 2
                     progress = 0.5
+                    source = "fallback"
                 else:
                     lat = None
                     lng = None
                     progress = 0.0
-        
+                    source = "unknown"
+
         out.append(
             Vehicle(
                 trip_id=trip_id,
@@ -303,7 +323,9 @@ def map_odpt_trains_to_vehicles(items: List[Dict[str, Any]]) -> List[Vehicle]:
                 from_stop_id=from_station_id,
                 to_stop_id=to_station_id,
                 timestamp=ts_epoch,
-                progress=progress
+                progress=progress,
+                source=source,
+                delay=delay
             )
         )
     

@@ -296,43 +296,166 @@ const TokyoTrainMap2D = () => {
     setStatus('✓ ライブ接続を切断');
   };
 
-  // 補間アニメーション
-  useEffect(() => {
-    if (!realtimeMode || Object.keys(realtimePositions).length === 0) return;
+  // 時刻表ベースの連続補間を計算する関数（クライアント側）
+  const calculateContinuousPosition = useCallback((tripId, rtPos, currentTimeOfDay) => {
+    // サーバーから受信したfrom_stop_id/to_stop_idと遅延を使用
+    const fromStopId = rtPos.from_stop_id;
+    const toStopId = rtPos.to_stop_id;
+    const delay = rtPos.delay || 0;
 
-    let lastTime = Date.now();
-    const interpolationStartTime = Date.now();
+    // 停車中の場合、駅位置を返す
+    if (!toStopId || rtPos.status === 'STOPPED_AT') {
+      return rtPos.lat && rtPos.lng ? {
+        lat: rtPos.lat,
+        lng: rtPos.lng,
+        source: rtPos.source || 'schedule',
+        progress: 0
+      } : null;
+    }
+
+    // 列車の時刻表を探す
+    const train = trains.find(t => t.tripId === tripId || t.tripId.includes(tripId) || tripId.includes(t.tripId));
+    if (!train || !train.schedule) {
+      // 時刻表が見つからない場合、サーバーの位置をそのまま使用
+      return rtPos.lat && rtPos.lng ? {
+        lat: rtPos.lat,
+        lng: rtPos.lng,
+        source: rtPos.source || 'realtime',
+        progress: rtPos.progress || 0.5
+      } : null;
+    }
+
+    // from_stop_id/to_stop_idに対応する駅を時刻表から探す
+    // ODPT形式のIDから駅名を抽出して照合
+    const extractStationName = (odptId) => {
+      if (!odptId) return '';
+      const parts = odptId.split('.');
+      return parts[parts.length - 1]; // 例: "Shinjuku"
+    };
+
+    const fromStationName = extractStationName(fromStopId);
+    const toStationName = extractStationName(toStopId);
+
+    // 時刻表から該当する区間を探す
+    let fromStop = null;
+    let toStop = null;
+
+    for (let i = 0; i < train.schedule.length - 1; i++) {
+      const current = train.schedule[i];
+      const next = train.schedule[i + 1];
+
+      const currentStation = stopsMap[current.stopId];
+      const nextStation = stopsMap[next.stopId];
+
+      if (currentStation && nextStation) {
+        const currentName = currentStation.name.replace(/\s/g, '').toLowerCase();
+        const nextName = nextStation.name.replace(/\s/g, '').toLowerCase();
+
+        if (currentName.includes(fromStationName.toLowerCase()) &&
+            nextName.includes(toStationName.toLowerCase())) {
+          fromStop = { ...current, station: currentStation };
+          toStop = { ...next, station: nextStation };
+          break;
+        }
+      }
+    }
+
+    if (!fromStop || !toStop) {
+      // 該当区間が見つからない場合、サーバーの位置を使用
+      return rtPos.lat && rtPos.lng ? {
+        lat: rtPos.lat,
+        lng: rtPos.lng,
+        source: rtPos.source || 'realtime',
+        progress: rtPos.progress || 0.5
+      } : null;
+    }
+
+    // 時刻を秒に変換して進捗率を計算
+    const depTime = timeToSeconds(fromStop.departure || fromStop.arrival) + delay;
+    const arrTime = timeToSeconds(toStop.arrival) + delay;
+
+    if (arrTime <= depTime) {
+      return {
+        lat: fromStop.station.lat,
+        lng: fromStop.station.lng,
+        source: 'schedule',
+        progress: 0
+      };
+    }
+
+    const progress = Math.max(0, Math.min(1, (currentTimeOfDay - depTime) / (arrTime - depTime)));
+
+    // 座標を線形補間
+    const lat = fromStop.station.lat + (toStop.station.lat - fromStop.station.lat) * progress;
+    const lng = fromStop.station.lng + (toStop.station.lng - fromStop.station.lng) * progress;
+
+    return {
+      lat,
+      lng,
+      source: 'interpolated',
+      progress,
+      fromStation: fromStop.station.name,
+      toStation: toStop.station.name
+    };
+  }, [trains, stopsMap]);
+
+  // 補間アニメーション（60fps連続）
+  useEffect(() => {
+    if (!realtimeMode) return;
+
+    let animationRunning = true;
 
     const animate = () => {
+      if (!animationRunning) return;
+
       const now = Date.now();
-      const elapsed = (now - interpolationStartTime) / 1000;
-      const alpha = Math.min(1, elapsed / INTERPOLATION_SEC);
+      const currentTimeSec = now / 1000;
+
+      // 現在時刻（当日の経過秒数）を計算
+      const date = new Date();
+      const currentTimeOfDay = date.getHours() * 3600 + date.getMinutes() * 60 + date.getSeconds();
 
       // 補間位置を計算
       const newInterpolated = {};
-      Object.entries(realtimePositions).forEach(([tripId, pos]) => {
+
+      Object.entries(realtimePositions).forEach(([tripId, rtPos]) => {
         // TTLチェック
         const lastSeen = lastSeenByTrip[tripId] || 0;
-        const age = Date.now() / 1000 - lastSeen;
+        const age = currentTimeSec - lastSeen;
 
-        if (age <= TTL_SEC) {
-          newInterpolated[tripId] = pos; // 最新位置を使用（補間は将来の拡張用）
+        if (age > TTL_SEC) {
+          // TTL切れ：表示しない
+          return;
+        }
+
+        // クライアント側で時刻表ベースの連続補間を実行
+        const interpolated = calculateContinuousPosition(tripId, rtPos, currentTimeOfDay);
+
+        if (interpolated) {
+          newInterpolated[tripId] = {
+            ...interpolated,
+            status: rtPos.status,
+            timestamp: rtPos.timestamp,
+            from_stop_id: rtPos.from_stop_id,
+            to_stop_id: rtPos.to_stop_id,
+            delay: rtPos.delay
+          };
         }
       });
 
       setInterpolatedPositions(newInterpolated);
-      lastTime = now;
       animationFrameRef.current = requestAnimationFrame(animate);
     };
 
     animationFrameRef.current = requestAnimationFrame(animate);
 
     return () => {
+      animationRunning = false;
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
     };
-  }, [realtimeMode, realtimePositions, lastSeenByTrip]);
+  }, [realtimeMode, realtimePositions, lastSeenByTrip, calculateContinuousPosition]);
 
   // ファイルアップロード
   const handleFileUpload = async (event) => {
@@ -527,22 +650,42 @@ const TokyoTrainMap2D = () => {
     trainPositions.forEach((train, idx) => {
       if (train.position) {
         const pos = latLngToCanvas(train.position.lat, train.position.lng, width, height);
-        const isRealtime = train.position.source === 'realtime';
+        const source = train.position.source || 'unknown';
 
-        // リアルタイムの波紋エフェクト
-        if (isRealtime) {
+        // 色分け：
+        // - 'interpolated': 緑（時刻表ベースの補間）
+        // - 'schedule': 黄（駅停車中）
+        // - 'realtime': 青（リアルタイム）
+        // - 'fallback': グレー（フォールバック）
+        let trainColor = '#4CAF50'; // デフォルトは緑
+        let showRipple = false;
+
+        if (source === 'interpolated') {
+          trainColor = '#4CAF50'; // 緑：時刻表補間
+          showRipple = true;
+        } else if (source === 'schedule') {
+          trainColor = '#FFC107'; // 黄：駅停車中
+        } else if (source === 'realtime') {
+          trainColor = '#2196F3'; // 青：リアルタイム
+          showRipple = true;
+        } else if (source === 'fallback') {
+          trainColor = '#9E9E9E'; // グレー：フォールバック
+        }
+
+        // 波紋エフェクト（補間中の列車のみ）
+        if (showRipple && realtimeMode) {
           const now = Date.now() / 1000;
           const age = now - (lastSeenByTrip[train.tripId] || now);
           const freshness = Math.max(0, 1 - age / 5); // 5秒で薄くなる
 
-          ctx.fillStyle = `rgba(33, 150, 243, ${0.2 * freshness})`;
+          ctx.fillStyle = `${trainColor}33`; // 透明度20%
           ctx.beginPath();
           ctx.arc(pos.x, pos.y, 16, 0, Math.PI * 2);
           ctx.fill();
         }
 
         // 列車本体
-        ctx.fillStyle = isRealtime ? '#2196F3' : train.color;
+        ctx.fillStyle = trainColor;
         ctx.strokeStyle = '#fff';
         ctx.lineWidth = 2;
         ctx.beginPath();
@@ -714,32 +857,50 @@ const TokyoTrainMap2D = () => {
                   const isRealtime = train.position.source === 'realtime';
                   const age = isRealtime ? (Date.now() / 1000 - (lastSeenByTrip[train.tripId] || 0)) : 0;
 
+                  const source = train.position.source || 'unknown';
+                  const sourceLabels = {
+                    'interpolated': '時刻表補間',
+                    'schedule': '駅停車中',
+                    'realtime': 'リアルタイム',
+                    'fallback': 'フォールバック',
+                    'unknown': '不明'
+                  };
+
                   return (
                     <div className="text-sm">
                       <div className="flex items-center gap-2 mb-1">
                         <div className="font-bold">{routesMap[train.routeId]?.name}</div>
-                        {isRealtime && (
-                          <div className="flex items-center gap-1 text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded">
-                            <Wifi size={12} />
-                            LIVE
-                          </div>
-                        )}
+                        <div className={`flex items-center gap-1 text-xs px-2 py-0.5 rounded ${
+                          source === 'interpolated' ? 'bg-green-100 text-green-700' :
+                          source === 'schedule' ? 'bg-yellow-100 text-yellow-700' :
+                          source === 'realtime' ? 'bg-blue-100 text-blue-700' :
+                          'bg-gray-100 text-gray-700'
+                        }`}>
+                          {source === 'interpolated' || source === 'realtime' ? <Wifi size={12} /> : null}
+                          {sourceLabels[source]}
+                        </div>
                       </div>
                       <div className="space-y-0.5">
                         <div><span className="font-semibold">行先:</span> {train.headsign}</div>
                         <div><span className="font-semibold">Trip:</span> {train.tripId}</div>
-                        {isRealtime && (
-                          <>
-                            <div className="text-xs text-gray-500 mt-1">
-                              位置: {train.position.lat.toFixed(5)}, {train.position.lng.toFixed(5)}
-                            </div>
-                            <div className="text-xs text-gray-500">
-                              鮮度: {age.toFixed(1)}秒前
-                            </div>
-                          </>
-                        )}
-                        {!isRealtime && train.position.fromStation && (
+                        {train.position.fromStation && (
                           <div><span className="font-semibold">区間:</span> {train.position.fromStation} → {train.position.toStation}</div>
+                        )}
+                        {train.position.progress !== undefined && (
+                          <div><span className="font-semibold">進捗:</span> {(train.position.progress * 100).toFixed(1)}%</div>
+                        )}
+                        {train.position.delay !== undefined && train.position.delay !== 0 && (
+                          <div className={train.position.delay > 0 ? 'text-red-600' : 'text-blue-600'}>
+                            <span className="font-semibold">遅延:</span> {train.position.delay > 0 ? '+' : ''}{train.position.delay}秒
+                          </div>
+                        )}
+                        <div className="text-xs text-gray-500 mt-1">
+                          位置: {train.position.lat.toFixed(5)}, {train.position.lng.toFixed(5)}
+                        </div>
+                        {isRealtime && (
+                          <div className="text-xs text-gray-500">
+                            鮮度: {age.toFixed(1)}秒前
+                          </div>
                         )}
                       </div>
                     </div>
@@ -773,21 +934,21 @@ const TokyoTrainMap2D = () => {
               </ul>
             </div>
             <div>
-              <p className="font-semibold mb-1">🎯 位置管理:</p>
+              <p className="font-semibold mb-1">🎯 位置補間:</p>
               <ul className="text-xs space-y-0.5 text-gray-700">
+                <li>• 時刻表ベースで駅間補間</li>
+                <li>• 60fps連続アニメーション</li>
+                <li>• 遅延を反映した位置計算</li>
                 <li>• TTL 15秒で鮮度判定</li>
-                <li>• 古いデータは時刻表へ</li>
-                <li>• trip_id で突合せ</li>
-                <li>• 補間アニメーション</li>
               </ul>
             </div>
             <div>
-              <p className="font-semibold mb-1">🎨 表示:</p>
+              <p className="font-semibold mb-1">🎨 表示色:</p>
               <ul className="text-xs space-y-0.5 text-gray-700">
+                <li>🟢 緑 = 時刻表補間（駅間）</li>
+                <li>🟡 黄 = 駅停車中</li>
                 <li>🔵 青 = リアルタイム</li>
-                <li>🟢 緑 = 時刻表予測</li>
-                <li>💫 波紋 = LIVE鮮度</li>
-                <li>⚡ 自動フォールバック</li>
+                <li>⚫ グレー = フォールバック</li>
               </ul>
             </div>
           </div>
